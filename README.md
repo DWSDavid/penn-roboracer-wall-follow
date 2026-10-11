@@ -6,10 +6,10 @@ A ROS 2 wall follower for the AutoDRIVE RoboRacer practice track (IROS 2026 rele
 
 | Result | Value |
 |---|---|
-| Fastest clean lap | **8.142 s** |
-| Longest run of clean laps | 45 in a row |
-| Wall contacts with the default settings | 0 in every validation run |
-| Video (Driver's Eye, unlisted YouTube) | link will be added here |
+| Fastest clean lap | **8.082 s** |
+| Video (Driver's Eye, unlisted) | https://youtu.be/COBlpFTkJeg |
+| Long run with the default settings | 154 of 164 laps clean, longest streak 42 |
+| Longest clean streak while tuning | 45 laps in a row |
 
 Lap times are the simulator's own lap clock, the same number the HUD shows.
 
@@ -17,7 +17,7 @@ Lap times are the simulator's own lap clock, the same number the HUD shows.
 
 ## Video
 
-The unlisted YouTube link of the car driving on its own in Driver's Eye view will go here once the recording is uploaded.
+[Unlisted YouTube video](https://youtu.be/COBlpFTkJeg). The car drives itself with the default settings, seen from the Driver's Eye camera. The HUD on the right shows the lap count, the current lap time and the best lap.
 
 ## How to run
 
@@ -76,7 +76,7 @@ Throttle is the target speed divided by 24.8, a gain measured in the simulator. 
 
 ### Restraint layer
 
-A separate check cuts throttle only when contact can no longer be avoided, meaning even the best arc has less than `ttc_brake` (0.5 s) of room at the current speed. The planner keeps a larger margin (`ttc_plan`, 0.6 s), so in normal driving it slows the car first and the restraint layer stays silent. The node counts every intervention, prints it in the lap report and publishes it on `/wall_follow/restraint_count`. With the default settings it did not fire once in the validation runs.
+A separate check cuts throttle only when contact can no longer be avoided, meaning even the best arc has less than `ttc_brake` (0.5 s) of room at the current speed. The planner keeps a larger margin (`ttc_plan`, 0.6 s), so in normal driving it slows the car first and the restraint layer stays silent. The node counts every intervention, prints it in the lap report and publishes it on `/wall_follow/restraint_count`. During tuning it stayed silent for 45 clean laps. In the later 164-lap run it fired 5 times. Four of those came too late to prevent the contact, and 6 contact laps had no warning at all, so it is quiet but does not yet catch every contact (see Known limitation).
 
 ## Measured before tuning
 
@@ -103,9 +103,14 @@ The throttle gain mattered most. The first draft's default throttle of 0.30 woul
 | v2 planner, top speed 2 m/s | 15.03 s | clean |
 | v2 planner, top speed 4 m/s | 10.04 s | clean |
 | v2 planner, top speed up to 7 m/s | 9.13 s | at 7 m/s it touched the wall twice, and the restraint layer fired 41 to 59 times per lap |
-| v2.1 escape-based planner, default settings | 8.142 s | 45 clean laps in a row, restraint layer silent |
+| v2.1 escape-based planner, default settings | 8.142 s | 45 clean laps in a row while tuning, restraint layer silent |
+| v2.1 default settings, 164-lap run | 8.082 s | 154 clean, 12 contacts on 10 laps, longest streak 42 |
 
 Settings were swept live with a script that changes parameters on the running node, skips one transition lap and then records lap times, contacts and restraint interventions. Above about 5 m/s the cap stops mattering because the corners limit the lap. Lap-to-lap scatter at the end was about 0.4 s, larger than the differences between the last few settings, so the defaults favour the setting that stayed clean the longest over the single fastest lap.
+
+## Known limitation
+
+Reliability depends on how often the controller gets a new scan. During tuning the LiDAR arrived at 40 to 73 Hz and the default setting ran 45 clean laps in a row. In the long run it measured about 31 Hz at one point (the Mac was also screen recording), and 10 of 164 laps had a contact. The contacts the restraint layer logged happened at 3.0 to 4.2 m/s. The lower update rate is the working explanation, not a confirmed one. On a slower machine the conservative preset in How to run is the safer choice. The next step is to scale the speed limits by the measured scan rate and check it under load.
 
 ## Three ways to predict a collision
 
