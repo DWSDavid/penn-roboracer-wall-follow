@@ -1,6 +1,10 @@
-__pycache__/
 build/
 install/
 log/
-*.zip
+__pycache__/
+*.pyc
+.pytest_cache/
+*.npz
 simulator/
+*.zip
+.DS_Store
