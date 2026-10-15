@@ -7,18 +7,18 @@ A ROS 2 wall follower for the AutoDRIVE RoboRacer practice track (IROS 2026 rele
 | Result | Value |
 |---|---|
 | Fastest clean lap | **7.904 s** |
-| Video (Driver's Eye, unlisted) | https://youtu.be/COBlpFTkJeg |
-| Final defaults, normal load | 12 of 12 laps clean from two fresh starts, best 8.002 s |
+| Video (Driver's Eye, unlisted) | https://youtu.be/ozXvCoFLh4Y |
+| Final defaults, normal load | 30 of 30 laps clean over three fresh starts, best 7.962 s |
 | Final defaults, heavy CPU load (21 to 29 Hz scans) | 44 of 45 laps clean |
 | Longest clean streak | 45 laps in a row |
 
-Lap times are the simulator's own lap clock, the same number the HUD shows. The 7.904 s lap was set with the tolerance band in place, just before latency compensation was added. The final defaults' best so far is 8.002 s.
+Lap times are the simulator's own lap clock, the same number the HUD shows. The 7.904 s lap was set with the tolerance band in place, just before latency compensation was added. The final defaults' best so far is 7.962 s.
 
 ![Speed on three clean laps with the final defaults](docs/speed_map.png)
 
 ## Video
 
-[Unlisted YouTube video](https://youtu.be/COBlpFTkJeg). The car drives itself, seen from the Driver's Eye camera. The HUD on the right shows the lap count, the current lap time and the best lap.
+[Unlisted YouTube video](https://youtu.be/ozXvCoFLh4Y). The car drives itself, seen from the Driver's Eye camera. The HUD on the right shows the lap count, the current lap time and the best lap. In the recorded run, with the final default settings, all 18 laps were clean. The warm-up lap took 14.3 s, the next two took 9.5 s and 8.8 s, and the best lap was 7.962 s.
 
 ## How to run
 
@@ -127,6 +127,7 @@ The throttle gain mattered most. The first draft's default throttle of 0.30 woul
 | v2.1, 164-lap run on a busy Mac | 8.082 s | 154 clean, 12 contacts on 10 laps |
 | v2.2 warm-up and 5 cm tolerance band | 7.904 s | 8 of 8 clean |
 | v2.2 final defaults (adds latency compensation) | 8.002 s | 12 of 12 clean from two fresh starts |
+| v2.2 final defaults, the recorded run | 7.962 s | 18 of 18 clean, warm-up lap 14.3 s |
 
 **Heavy load.** To reproduce the conditions of the 164-lap run, 18 busy loops ran in the Docker VM, which dropped the scan rate to 21 to 29 Hz. Each fresh start was a reset, three laps and a stop.
 
