@@ -13,8 +13,10 @@ import math
 import numpy as np
 
 from autodrive_roboracer.wall_follow_node import (
-    LIDAR_X, PID, arc_free_distance, beam_range, clean_ranges, control_step, drive_command,
-    ittc_min, plan_speed, scan_points, steer_to_curvature, throttle_for, wall_distance)
+    LIDAR_X, PID, apply_deadband, arc_free_distance, beam_range, blend_warmup, clean_ranges,
+    control_step,
+    drive_command, ittc_min, next_confidence, plan_speed, scan_points, steer_to_curvature,
+    throttle_for, wall_distance)
 
 N_BEAMS = 1081          # the live bridge sends 1081 (both ends of 270 deg)
 ANGLE_MIN = -2.35619
@@ -282,6 +284,95 @@ def test_planner_laps_the_narrow_track_faster_without_contact():
     assert max(p[6] for p in path) > 2.5, 'never reached speed on the straights'
     assert onsets <= 2, f'restraint layer fired {onsets} times'
     assert turned > 2 * (2 * math.pi) * 0.95, f'only turned {math.degrees(turned):.0f} deg'
+
+
+# ---- warm-up --------------------------------------------------------------
+WARM = dict(PLANNER, v_max=6.0, a_lat=6.0, a_brake=3.0, ttc_plan=0.6,
+            warmup_v_max=3.0, warmup_a_lat=4.0, warmup_a_brake=2.5, warmup_ttc_plan=0.8,
+            warmup_step=0.25, warmup_backoff=0.5)
+
+
+def test_confidence_reaches_full_after_four_clean_laps():
+    c, seen = 0.0, []
+    for _ in range(6):
+        c = next_confidence(c, True, WARM)
+        seen.append(c)
+    assert seen == [0.25, 0.5, 0.75, 1.0, 1.0, 1.0]
+
+
+def test_contact_halves_confidence_and_never_goes_negative():
+    assert next_confidence(1.0, False, WARM) == 0.5
+    assert next_confidence(0.5, False, WARM) == 0.25
+    assert next_confidence(0.0, False, WARM) == 0.0
+
+
+def test_blend_starts_cautious_and_ends_at_full_settings():
+    start, mid, full = (blend_warmup(WARM, c) for c in (0.0, 0.5, 1.0))
+    keys = ('v_max', 'a_lat', 'a_brake', 'ttc_plan')
+    assert tuple(start[k] for k in keys) == (3.0, 4.0, 2.5, 0.8)
+    assert tuple(full[k] for k in keys) == (6.0, 6.0, 3.0, 0.6)
+    assert abs(mid['v_max'] - 4.5) < 1e-9 and abs(mid['ttc_plan'] - 0.7) < 1e-9
+    assert start['kp'] == WARM['kp']          # steering is never changed by the warm-up
+
+
+# ---- tolerance band and derivative floor --------------------------------------
+def test_deadband_zeroes_small_errors_and_is_continuous():
+    assert apply_deadband(0.03, 0.05) == 0.0 and apply_deadband(-0.05, 0.05) == 0.0
+    assert abs(apply_deadband(0.08, 0.05) - 0.03) < 1e-12
+    assert abs(apply_deadband(-0.08, 0.05) + 0.03) < 1e-12
+    assert abs(apply_deadband(0.0501, 0.05)) < 1e-3          # no jump at the edge
+
+
+def test_wheels_stay_straight_when_slightly_off_centre():
+    walls = [((-20.0, 0.62), (20.0, 0.62)), ((-20.0, -0.68), (20.0, -0.68))]   # 3 cm off
+    r = clean_ranges(scan(0, 0, 0, walls), 0.06, RANGE_MAX)
+    prm = dict(PLANNER, deadband=0.05)
+    assert control_step(r, ANGLE_MIN, ANGLE_INC, prm, PID(), None)[0] == 0.0
+    assert control_step(r, ANGLE_MIN, ANGLE_INC, dict(prm, deadband=0.0), PID(), None)[0] < 0
+
+
+def test_derivative_ignores_scan_bursts():
+    burst, normal = PID(), PID()
+    burst.step(0.0, None, 0.0, 0.0, 1.0)
+    normal.step(0.0, None, 0.0, 0.0, 1.0)
+    # same 1 cm change in error arriving 1 ms later vs 20 ms later
+    assert abs(burst.step(0.01, 0.001, 0.0, 0.0, 1.0)) <= 1.0 + 1e-9   # floored at 10 ms
+    assert abs(normal.step(0.01, 0.02, 0.0, 0.0, 1.0) - 0.5) < 1e-9
+
+
+def test_narrow_track_with_warm_settings_and_deadband_has_no_contact():
+    o, i = 0.65, 0.65
+    outer = [(-o, -o), (12 + o, -o), (12 + o, 8 + o), (-o, 8 + o)]
+    inner = [(i, i), (12 - i, i), (12 - i, 8 - i), (i, 8 - i)]
+    walls = [(poly[k], poly[(k + 1) % 4]) for poly in (outer, inner) for k in range(4)]
+    prm = dict(PLANNER, v_max=4.0, a_lat=5.0, lookahead=0.6, lookahead_per_speed=0.25,
+               deadband=0.05)
+    path = drive(walls, 6.0, 0.0, 0.0, prm, seconds=30.0)
+    assert min(p[5] for p in path) > CAR_RADIUS, 'touched a wall'
+
+
+# ---- latency compensation --------------------------------------------------
+def test_latency_shrinks_free_space_by_distance_covered():
+    wall = [((3.0, -3.0), (3.0, 3.0))]                          # wall 3 m ahead
+    r = clean_ranges(scan(0, 0, 0, wall), 0.06, RANGE_MAX)
+    fast = dict(PLANNER, v_max=6.0)
+    _, _, a = drive_command(r, ANGLE_MIN, ANGLE_INC, RANGE_MAX, 4.0, dict(fast, delay=0.0),
+                            PID(), None)
+    _, _, b = drive_command(r, ANGLE_MIN, ANGLE_INC, RANGE_MAX, 4.0, dict(fast, delay=0.1),
+                            PID(), None)
+    assert abs(a['free_now'] - b['free_now'] - 0.4) < 1e-6      # 4 m/s x 0.1 s
+    assert b['v_target'] <= a['v_target'] and b['ttc_escape'] < a['ttc_escape']
+
+
+def test_planner_with_latency_still_laps_the_narrow_track():
+    o, i = 0.65, 0.65
+    outer = [(-o, -o), (12 + o, -o), (12 + o, 8 + o), (-o, 8 + o)]
+    inner = [(i, i), (12 - i, i), (12 - i, 8 - i), (i, 8 - i)]
+    walls = [(poly[k], poly[(k + 1) % 4]) for poly in (outer, inner) for k in range(4)]
+    prm = dict(PLANNER, v_max=4.0, a_lat=5.0, lookahead=0.6, lookahead_per_speed=0.25,
+               deadband=0.05, delay=0.075)
+    path = drive(walls, 6.0, 0.0, 0.0, prm, seconds=30.0)
+    assert min(p[5] for p in path) > CAR_RADIUS, 'touched a wall'
 
 
 if __name__ == '__main__':

@@ -15,6 +15,8 @@ Steering (v1, F1TENTH lab 3 wall following)
     Centre:    error = (d_t1_left - d_t1_right) / 2, steer = PID(error).
     Positive error means too far from the wall (or right of centre), so the
     car steers toward it. Steering +1 is full left lock (about 0.52 rad).
+    A tolerance band (deadband, 5 cm) treats small errors as zero so the
+    wheels stay still on the straights instead of twitching.
     The lookahead L grows with speed (lookahead + lookahead_per_speed * v).
 
 Speed (v2, speed_mode:=planner, default)
@@ -24,6 +26,15 @@ Speed (v2, speed_mode:=planner, default)
     lateral-acceleration limit for the current steering, the speed that can
     still stop within the most open arc, and the speed that keeps ttc_plan
     seconds of that room. Throttle is target speed / 24.8 (measured).
+    Warm-up (warmup:=true, default): the car starts cautious (warmup_* values,
+    first lap capped at 3 m/s) and earns speed. Each clean lap raises a
+    confidence value by warmup_step; a wall contact halves it at once. The
+    speed settings are interpolated between cautious and full by confidence.
+    Latency compensation: the node measures the time between scans and
+    assumes a command acts latency_scans scans later. The distance the car
+    covers in that time is added to the steering lookahead and taken off
+    every free distance, so slower scan rates automatically mean earlier
+    braking and earlier turn-in.
     A restraint layer cuts throttle only when no reachable arc has room for
     ttc_brake seconds, and counts every time it acts (restraint_count topic).
     speed_mode:=throttle keeps the v1 rule (throttle scaled by steering and by
@@ -112,17 +123,30 @@ def throttle_for(steer, front, base, minimum, brake_dist, stop_dist):
     return throttle
 
 
-class PID:
-    """PID on the wall-distance error, with a clamped integral (anti-windup)."""
+def apply_deadband(error, band):
+    """Tolerance band: errors within +-band count as zero, so the wheels stay
+    still while the car is close enough to where it should be. Outside the
+    band the error is reduced by band, so steering does not jump at the edge."""
+    return math.copysign(max(0.0, abs(error) - band), error)
 
-    def __init__(self, i_limit=2.0):
+
+class PID:
+    """PID on the wall-distance error, with a clamped integral (anti-windup).
+
+    dt is floored at min_dt: scans can arrive in bursts under load, and a
+    1 ms gap would turn a tiny change in error into a large derivative kick.
+    """
+
+    def __init__(self, i_limit=2.0, min_dt=0.01):
         self.i_limit = i_limit
+        self.min_dt = min_dt
         self.integral = 0.0
         self.prev_error = None
 
     def step(self, error, dt, kp, ki, kd):
         deriv = 0.0
         if dt is not None and dt > 0.0:
+            dt = max(dt, self.min_dt)
             self.integral = max(-self.i_limit, min(self.i_limit, self.integral + error * dt))
             if self.prev_error is not None:
                 deriv = (error - self.prev_error) / dt
@@ -150,7 +174,8 @@ def control_step(ranges, angle_min, angle_inc, prm, pid, dt):
         d_t1, alpha = (d_left, a_left) if sign > 0 else (d_right, a_right)
         # positive error = too far from the wall, so steer toward it
         error = d_t1 - prm['desired_dist']
-    u = pid.step(error, dt, prm['kp'], prm['ki'], prm['kd'])
+    u = pid.step(apply_deadband(error, prm.get('deadband', 0.0)), dt,
+                 prm['kp'], prm['ki'], prm['kd'])
     steer = max(-prm['max_steer'], min(prm['max_steer'], sign * u))
     throttle = throttle_for(steer, front, prm['base_throttle'], prm['min_throttle'],
                             prm['front_brake_dist'], prm['front_stop_dist'])
@@ -225,6 +250,32 @@ def plan_speed(steer, free_best, free_now, prm):
     return v_target, v_curve, v_free, v_react
 
 
+# Settings that scale with confidence. At confidence 0 the car uses the
+# warmup_* values (the cautious setting it starts with); at 1 the full ones.
+WARMUP_KEYS = ('v_max', 'a_lat', 'a_brake', 'ttc_plan')
+
+
+def next_confidence(confidence, clean, prm):
+    """Confidence for the next lap, between 0 and 1.
+
+    The car starts at 0 and earns speed: a clean lap adds warmup_step, a
+    wall contact multiplies confidence by warmup_backoff (additive increase,
+    multiplicative decrease, the rule TCP uses for congestion control).
+    """
+    if clean:
+        return min(1.0, confidence + prm['warmup_step'])
+    return max(0.0, confidence * prm['warmup_backoff'])
+
+
+def blend_warmup(prm, confidence):
+    """Return prm with the WARMUP_KEYS interpolated by confidence."""
+    out = dict(prm)
+    for key in WARMUP_KEYS:
+        lo, hi = prm['warmup_' + key], prm[key]
+        out[key] = lo + (hi - lo) * confidence
+    return out
+
+
 def drive_command(ranges, angle_min, angle_inc, range_max, v, prm, pid, dt):
     """Full controller: steering from control_step, then speed.
 
@@ -238,18 +289,22 @@ def drive_command(ranges, angle_min, angle_inc, range_max, v, prm, pid, dt):
     """
     if prm['speed_mode'] != 'planner':
         return control_step(ranges, angle_min, angle_inc, prm, pid, dt)
-    # look further ahead at higher speed (a fixed time horizon), so the
-    # steering does not zig-zag on the straights
+    # Latency compensation: a command takes effect about prm['delay'] seconds
+    # after the scan it was computed from, and the car keeps moving meanwhile.
+    travel = max(0.0, v) * prm.get('delay', 0.0)
+    # look further ahead at higher speed (a fixed time horizon) so the steering
+    # does not zig-zag on straights, plus the distance covered during the delay
     steer, throttle, info = control_step(
         ranges, angle_min, angle_inc,
-        dict(prm, lookahead=prm['lookahead'] + prm['lookahead_per_speed'] * max(0.0, v)),
+        dict(prm, lookahead=prm['lookahead'] + prm['lookahead_per_speed'] * max(0.0, v) + travel),
         pid, dt)
     px, py = scan_points(ranges, angle_min, angle_inc, range_max)
     hw, oh, ms = prm['half_width'], prm['front_overhang'], prm['max_s']
-    free_now = arc_free_distance(px, py, steer_to_curvature(steer), hw, oh, ms)
+    # every free distance shrinks by what the car covers before it can react
+    free_now = max(0.0, arc_free_distance(px, py, steer_to_curvature(steer), hw, oh, ms) - travel)
     fan = np.linspace(-1.0, 1.0, int(prm['n_arcs']))
-    fan_free = np.array([arc_free_distance(px, py, steer_to_curvature(st), hw, oh, ms)
-                         for st in fan])
+    fan_free = np.array([max(0.0, arc_free_distance(px, py, steer_to_curvature(st), hw, oh, ms)
+                             - travel) for st in fan])
     free_best = float(fan_free.max())
     reach = np.abs(fan - steer) <= prm['steer_band'] + 1e-9
     free_escape = max(free_now, float(fan_free[reach].max()) if reach.any() else 0.0)
@@ -262,7 +317,7 @@ def drive_command(ranges, angle_min, angle_inc, range_max, v, prm, pid, dt):
         throttle = 0.0
     info.update(free_now=free_now, free_best=free_best, v_target=v_target, v_curve=v_curve,
                 v_free=v_free, v_react=v_react, ttc_arc=ttc_arc, free_escape=free_escape,
-                ttc_escape=ttc_escape, intervene=intervene,
+                ttc_escape=ttc_escape, intervene=intervene, travel=travel,
                 ittc=ittc_min(ranges, angle_min, angle_inc, v))
     return steer, throttle, info
 
@@ -277,6 +332,7 @@ class WallFollowNode(Node):
         self.declare_parameter('desired_dist', 0.65)   # m, one-wall modes only
         self.declare_parameter('lookahead', 0.6)       # m, projection distance L at standstill
         self.declare_parameter('theta_deg', 45.0)      # deg between beams a and b
+        self.declare_parameter('deadband', 0.05)       # m, errors within +-deadband count as 0
         # kp 2.0 suits centre mode (its error is half the left-right difference);
         # in a narrow toy track lower gains ran wide and higher ones cut corners.
         # For one-wall modes start near kp 1.0.
@@ -291,6 +347,10 @@ class WallFollowNode(Node):
         self.declare_parameter('front_brake_dist', 1.5)  # m, start slowing for a wall ahead
         self.declare_parameter('front_stop_dist', 0.6)   # m, down to min_throttle here
         self.declare_parameter('log_period', 1.0)        # s between status lines, 0 = off
+        self.declare_parameter('scan_timeout', 0.5)      # s without LiDAR, then throttle 0
+        # Latency compensation: delay = latency_scans x the measured scan interval
+        # (sim -> bridge -> node -> bridge -> sim). 0 turns it off.
+        self.declare_parameter('latency_scans', 3.0)
         # ---- v2 speed planner (speed_mode:=planner) ------------------------
         # Defaults below are the setting validated on the practice track
         # (8 consecutive clean laps, 8.14 to 9.14 s, no restraint interventions).
@@ -313,6 +373,17 @@ class WallFollowNode(Node):
         self.declare_parameter('ttc_brake', 0.5)    # s, restraint layer threshold
         self.declare_parameter('ttc_plan', 0.6)     # s of escape room the planner keeps
         self.declare_parameter('lookahead_per_speed', 0.25)  # s, lookahead += this * speed
+        # ---- warm-up: start cautious, earn speed with clean laps -------------
+        # Confidence 0 uses the warmup_* values (validated: 0 contacts, ~11 s
+        # laps); confidence 1 uses the full values above. Clean lap: +step.
+        # Wall contact: confidence *= backoff, applied immediately.
+        self.declare_parameter('warmup', True)
+        self.declare_parameter('warmup_v_max', 3.0)
+        self.declare_parameter('warmup_a_lat', 4.0)
+        self.declare_parameter('warmup_a_brake', 2.5)
+        self.declare_parameter('warmup_ttc_plan', 0.8)
+        self.declare_parameter('warmup_step', 0.25)     # 4 clean laps to full speed
+        self.declare_parameter('warmup_backoff', 0.5)
 
         side_name = str(self.p('side')).lower()
         if side_name not in SIDES and side_name != 'center':
@@ -340,6 +411,13 @@ class WallFollowNode(Node):
         self.create_subscription(LaserScan, TOPIC + 'lidar', self.scan_callback, qos_scan)
         self.speed = 0.0
         self.create_subscription(Odometry, TOPIC + 'odom', self.on_odom, qos_scan)
+        # 10 Hz watchdog. It also keeps the executor waking up, so Ctrl-C is handled
+        # even when no scans arrive (the node handles signals itself, see main()).
+        self.last_scan_time = None
+        self.scan_lost = False
+        self.scan_interval = None   # moving average of the time between scans, s
+        self.create_timer(0.1, self.watchdog)
+        self.confidence = 0.0 if bool(self.p('warmup')) else 1.0
         self.interventions = 0
         self.pub_restraints = self.create_publisher(Int32, '/wall_follow/restraint_count', 10)
         self.interventions_at_lap_start = 0
@@ -353,6 +431,10 @@ class WallFollowNode(Node):
         what = 'centred between both walls' if side_name == 'center' else \
             f'following the {side_name.upper()} wall'
         self.get_logger().info(f'wall_follow_node started, {what}')
+        if bool(self.p('warmup')):
+            self.get_logger().info(
+                f"warm-up on: first lap capped at {float(self.p('warmup_v_max')):.1f} m/s, "
+                f"full speed after {math.ceil(1.0 / float(self.p('warmup_step'))):d} clean laps")
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -360,25 +442,56 @@ class WallFollowNode(Node):
     # ------------------------------------------------------------------
     def params(self):
         prm = {name: float(self.p(name)) for name in (
-            'desired_dist', 'lookahead', 'theta_deg', 'kp', 'ki', 'kd', 'max_steer',
+            'desired_dist', 'lookahead', 'theta_deg', 'deadband', 'kp', 'ki', 'kd', 'max_steer',
             'base_throttle', 'min_throttle', 'front_brake_dist', 'front_stop_dist')}
         for name in ('speed_per_throttle', 'v_max', 'v_min', 'a_lat', 'a_brake', 'stop_margin',
                      'v_hysteresis', 'half_width', 'front_overhang', 'max_s', 'n_arcs',
-                     'ttc_brake', 'ttc_plan', 'lookahead_per_speed', 'steer_band'):
+                     'ttc_brake', 'ttc_plan', 'lookahead_per_speed', 'steer_band',
+                     'warmup_v_max', 'warmup_a_lat', 'warmup_a_brake', 'warmup_ttc_plan',
+                     'warmup_step', 'warmup_backoff'):
             prm[name] = float(self.p(name))
         prm['side'] = str(self.p('side')).lower()
         prm['speed_mode'] = str(self.p('speed_mode')).lower()
+        prm['warmup'] = bool(self.p('warmup'))
         return prm
+
+    def driving_params(self):
+        """Parameters for this scan, with the warm-up and latency compensation applied."""
+        prm = self.params()
+        prm['delay'] = float(self.p('latency_scans')) * (self.scan_interval or 0.0)
+        return blend_warmup(prm, self.confidence) if prm['warmup'] else prm
+
+    def watchdog(self):
+        """Stop the car if the LiDAR goes quiet; the bridge would otherwise keep
+        applying the last throttle it received."""
+        if self.last_scan_time is None:
+            return
+        silent = self.get_clock().now().nanoseconds * 1e-9 - self.last_scan_time
+        if silent > float(self.p('scan_timeout')):
+            self.pub_throttle.publish(Float32(data=0.0))
+            self.pub_steering.publish(Float32(data=0.0))
+            if not self.scan_lost:
+                self.scan_lost = True
+                self.get_logger().warn(
+                    f'no LiDAR for {silent:.1f} s, throttle 0 until scans return')
 
     def scan_callback(self, scan: LaserScan):
         ranges = clean_ranges(scan.ranges, scan.range_min, scan.range_max)
         now = self.get_clock().now().nanoseconds * 1e-9
-        dt = None if self.prev_time is None else max(1e-3, now - self.prev_time)
+        if self.last_scan_time is not None:
+            gap = min(0.5, max(0.005, now - self.last_scan_time))
+            self.scan_interval = gap if self.scan_interval is None else \
+                0.9 * self.scan_interval + 0.1 * gap
+        self.last_scan_time = now
+        if self.scan_lost:
+            self.scan_lost = False
+            self.get_logger().info('LiDAR back, driving again')
+        dt = None if self.prev_time is None else now - self.prev_time   # PID floors it
         self.prev_time = now
 
         steer, throttle, info = drive_command(ranges, scan.angle_min, scan.angle_increment,
-                                              scan.range_max, self.speed, self.params(),
-                                              self.pid, dt)
+                                              scan.range_max, self.speed,
+                                              self.driving_params(), self.pid, dt)
         if info.get('intervene') and not self.intervening:
             self.interventions += 1
             self.pub_restraints.publish(Int32(data=self.interventions))
@@ -398,7 +511,8 @@ class WallFollowNode(Node):
                 f"L={left:.2f} R={right:.2f} F={info['front']:.2f} "
                 f"dL={info['d_left']:.2f} dR={info['d_right']:.2f} "
                 f"alpha={math.degrees(info['alpha']):+.1f} err={info['error']:+.2f} "
-                f'steer={steer:+.2f} thr={throttle:.3f} v={self.speed:.2f}'
+                f'steer={steer:+.2f} thr={throttle:.3f} v={self.speed:.2f} '
+                f'scan_hz={1.0 / self.scan_interval if self.scan_interval else 0:.0f}'
                 + (f" v_tgt={info['v_target']:.2f} free={info['free_now']:.2f}/"
                    f"{info['free_best']:.2f} ttc_arc={info['ttc_arc']:.2f} "
                    f"ttc_esc={info['ttc_escape']:.2f} "
@@ -419,14 +533,19 @@ class WallFollowNode(Node):
     # ---- lap report (tuning aid only, does not affect driving) -----------
     def on_lap_count(self, msg: Int32):
         if self.lap_count is not None and msg.data < self.lap_count:
-            self.get_logger().info('reset detected, clean-lap streak back to 0')
+            self.get_logger().info('reset detected, clean-lap streak and confidence back to 0')
             self.clean_streak = 0
+            if bool(self.p('warmup')):
+                self.confidence = 0.0
             self.collisions_at_lap_start = self.collisions
         self.lap_count = msg.data
 
     def on_collision_count(self, msg: Int32):
         if self.collisions is not None and msg.data > self.collisions:
             self.get_logger().warn(f'WALL CONTACT (total {msg.data}), this lap will not count')
+            if bool(self.p('warmup')):
+                self.confidence = next_confidence(self.confidence, False, self.params())
+                self.get_logger().warn(f'warm-up: confidence cut to {self.confidence:.2f}')
         if self.collisions is None or msg.data < self.collisions:
             self.collisions_at_lap_start = msg.data
         self.collisions = msg.data
@@ -452,10 +571,13 @@ class WallFollowNode(Node):
         restraints = self.interventions - self.interventions_at_lap_start
         self.interventions_at_lap_start = self.interventions
         self.clean_streak = self.clean_streak + 1 if hits == 0 else 0
+        if hits == 0 and bool(self.p('warmup')):
+            self.confidence = next_confidence(self.confidence, True, self.params())
         verdict = 'CLEAN' if hits == 0 else f'{hits} wall contact(s)'
         self.get_logger().info(
             f'LAP {self.lap_count}: {t:.3f} s, {verdict}, best {self.best_lap:.3f} s, '
-            f'clean streak {self.clean_streak}, restraint interventions {restraints}')
+            f'clean streak {self.clean_streak}, restraint interventions {restraints}, '
+            f'confidence {self.confidence:.2f}')
 
 
 def _raise_keyboard_interrupt(signum, frame):
