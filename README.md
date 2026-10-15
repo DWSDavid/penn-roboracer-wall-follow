@@ -18,7 +18,7 @@ Lap times are the simulator's own lap clock, the same number the HUD shows. The 
 
 ## Video
 
-[Unlisted YouTube video](https://youtu.be/COBlpFTkJeg). The car drives itself, seen from the Driver's Eye camera. The HUD on the right shows the lap count, the current lap time and the best lap. It was recorded with the earlier v2.1 settings, before the warm-up was added.
+[Unlisted YouTube video](https://youtu.be/COBlpFTkJeg). The car drives itself, seen from the Driver's Eye camera. The HUD on the right shows the lap count, the current lap time and the best lap.
 
 ## How to run
 
